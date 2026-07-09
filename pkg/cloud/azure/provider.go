@@ -987,6 +987,7 @@ func (az *Azure) DownloadPricingData() error {
 		}
 	}
 	addAzureFilePricing(allPrices, regions)
+	ensureDiskClassFallbacks(allPrices)
 
 	az.Pricing = allPrices
 	az.pricingSource = rateCardPricingSource
@@ -1018,6 +1019,7 @@ func (az *Azure) DownloadPricingData() error {
 				return
 			}
 			addAzureFilePricing(allPrices, regions)
+			ensureDiskClassFallbacks(allPrices)
 			az.Pricing = allPrices
 			az.pricingSource = priceSheetPricingSource
 			az.priceSheetPricingError = nil
@@ -1048,31 +1050,61 @@ func convertMeterToPricings(info commerce.MeterInfo, regions map[string]string, 
 
 	if strings.Contains(meterCategory, "Storage") {
 		if strings.Contains(meterSubCategory, "HDD") || strings.Contains(meterSubCategory, "SSD") || strings.Contains(meterSubCategory, "Premium Files") {
-			var storageClass string = ""
-			if strings.Contains(meterName, "P4 ") {
-				storageClass = AzureDiskPremiumSSDStorageClass
-			} else if strings.Contains(meterName, "E4 ") {
-				storageClass = AzureDiskStandardSSDStorageClass
-			} else if strings.Contains(meterName, "S4 ") {
-				storageClass = AzureDiskStandardStorageClass
-			} else if strings.Contains(meterName, "LRS Provisioned") {
-				storageClass = AzureFilePremiumStorageClass
+			if len(info.MeterRates) < 1 {
+				return nil, fmt.Errorf("missing rate info %+v", map[string]interface{}{"MeterSubCategory": *info.MeterSubCategory, "region": region})
+			}
+			var priceInUsd float64
+			for _, rate := range info.MeterRates {
+				priceInUsd += *rate
 			}
 
-			if storageClass != "" {
-				var priceInUsd float64
+			// Shared-disk mount fees are not modeled; skip so they cannot overwrite capacity prices.
+			if strings.Contains(meterName, "Disk Mount") {
+				log.Warnf("Azure shared disk mount pricing is not supported; skipping meter %q in region %s", meterName, region)
+				return nil, nil
+			}
 
-				if len(info.MeterRates) < 1 {
-					return nil, fmt.Errorf("missing rate info %+v", map[string]interface{}{"MeterSubCategory": *info.MeterSubCategory, "region": region})
+			results := make(map[string]*AzurePricing)
+
+			if storageClass, redundancy, tier, ok := parseManagedDiskMeter(meterName); ok {
+				tierKey := diskTierKey(region, storageClass, redundancy, tier)
+				priceStr := formatPrice(priceInUsd)
+				log.Debugf("Adding PV tier key: %s, MonthlyCost: %s", tierKey, priceStr)
+				results[tierKey] = &AzurePricing{
+					PV: &models.PV{
+						Cost:   priceStr, // monthly USD for the whole disk tier
+						Class:  storageClass,
+						Region: region,
+						Size:   tier,
+					},
 				}
-				for _, rate := range info.MeterRates {
-					priceInUsd += *rate
+
+				// Maintain a class-level linearized $/GiB-hour fallback from the
+				// smallest catalog LRS tier so size-unknown PVs still resolve.
+				if redundancy == azureDiskRedundancyLRS {
+					if smallest, ok := smallestDiskTier(storageClass); ok && smallest.Name == tier {
+						rate := effectiveGiBHourRate(priceInUsd, float64(smallest.SizeGiB))
+						classKey := diskClassKey(region, storageClass)
+						rateStr := formatPrice(rate)
+						log.Debugf("Adding PV class fallback key: %s, Cost: %s", classKey, rateStr)
+						results[classKey] = &AzurePricing{
+							PV: &models.PV{
+								Cost:   rateStr,
+								Class:  storageClass,
+								Region: region,
+							},
+						}
+					}
 				}
-				// rate is in disk per month, resolve price per hour, then GB per hour
+				return results, nil
+			}
+
+			if strings.Contains(meterName, "LRS Provisioned") {
+				// rate is in disk per month; Premium Files uses provisioned capacity.
+				// Keep historical linearization against 32 GiB for Azure Files Premium.
 				pricePerHour := priceInUsd / 730.0 / 32.0
-				priceStr := fmt.Sprintf("%f", pricePerHour)
-
-				key := region + "," + storageClass
+				priceStr := formatPrice(pricePerHour)
+				key := diskClassKey(region, AzureFilePremiumStorageClass)
 				log.Debugf("Adding PV.Key: %s, Cost: %s", key, priceStr)
 				return map[string]*AzurePricing{
 					key: {
@@ -1152,6 +1184,71 @@ func addAzureFilePricing(prices map[string]*AzurePricing, regions map[string]str
 			PV: &models.PV{
 				Cost:   zeroPrice,
 				Region: region,
+			},
+		}
+	}
+}
+
+// ensureDiskClassFallbacks fills missing region,storageClass linearized $/GiB-hour
+// keys from the smallest available LRS tier meter for that class. Needed when the
+// Rate Card omits the absolute smallest catalog tier (e.g. P1) but includes P4.
+func ensureDiskClassFallbacks(prices map[string]*AzurePricing) {
+	type candidate struct {
+		sizeGiB int
+		monthly float64
+		region  string
+		class   string
+	}
+	best := map[string]candidate{} // key: region,class
+
+	for key, pricing := range prices {
+		if pricing == nil || pricing.PV == nil {
+			continue
+		}
+		parts := strings.Split(key, ",")
+		if len(parts) != 4 {
+			continue
+		}
+		region, class, redundancy, tierName := parts[0], parts[1], parts[2], parts[3]
+		if redundancy != azureDiskRedundancyLRS {
+			continue
+		}
+		tiers := tiersForStorageClass(class)
+		var sizeGiB int
+		found := false
+		for _, tier := range tiers {
+			if tier.Name == tierName {
+				sizeGiB = tier.SizeGiB
+				found = true
+				break
+			}
+		}
+		if !found {
+			continue
+		}
+		monthly, err := parsePrice(pricing.PV.Cost)
+		if err != nil {
+			continue
+		}
+		ck := diskClassKey(region, class)
+		if existing, ok := best[ck]; ok && existing.sizeGiB <= sizeGiB {
+			continue
+		}
+		best[ck] = candidate{sizeGiB: sizeGiB, monthly: monthly, region: region, class: class}
+	}
+
+	for ck, c := range best {
+		if existing, ok := prices[ck]; ok && existing != nil && existing.PV != nil && existing.PV.Cost != "" {
+			continue
+		}
+		rate := effectiveGiBHourRate(c.monthly, float64(c.sizeGiB))
+		rateStr := formatPrice(rate)
+		log.Debugf("Adding PV class fallback key from available tiers: %s, Cost: %s", ck, rateStr)
+		prices[ck] = &AzurePricing{
+			PV: &models.PV{
+				Cost:   rateStr,
+				Class:  c.class,
+				Region: c.region,
 			},
 		}
 	}
@@ -1370,6 +1467,10 @@ type azurePvKey struct {
 	StorageClassParameters map[string]string
 	DefaultRegion          string
 	ProviderId             string
+	SizeGiB                float64
+	DiskStorageClass       string // premium_ssd / standard_ssd / standard_hdd when managed disk
+	DiskRedundancy         string // LRS / ZRS when managed disk
+	IsAzureFiles           bool
 }
 
 func (az *Azure) GetPVKey(pv *clustercache.PersistentVolume, parameters map[string]string, defaultRegion string) models.PVKey {
@@ -1377,13 +1478,16 @@ func (az *Azure) GetPVKey(pv *clustercache.PersistentVolume, parameters map[stri
 	if pv.Spec.AzureDisk != nil {
 		providerID = pv.Spec.AzureDisk.DiskName
 	}
-	return &azurePvKey{
+	key := &azurePvKey{
 		Labels:                 pv.Labels,
 		StorageClass:           pv.Spec.StorageClassName,
 		StorageClassParameters: parameters,
 		DefaultRegion:          defaultRegion,
 		ProviderId:             providerID,
+		SizeGiB:                pvSizeGiB(pv),
 	}
+	key.resolveSKU()
+	return key
 }
 
 func (key *azurePvKey) ID() string {
@@ -1394,33 +1498,45 @@ func (key *azurePvKey) GetStorageClass() string {
 	return key.StorageClass
 }
 
-func (key *azurePvKey) Features() string {
-	storageClass := key.StorageClassParameters["storageaccounttype"]
-	diskSKU := key.StorageClassParameters["skuname"]
+// resolveSKU populates DiskStorageClass / DiskRedundancy / IsAzureFiles from
+// StorageClass parameters (CSI skuname, legacy storageaccounttype, or file skuName).
+func (key *azurePvKey) resolveSKU() {
+	if key.StorageClassParameters == nil {
+		return
+	}
+	diskParam := key.StorageClassParameters["storageaccounttype"]
+	if diskParam == "" {
+		diskParam = key.StorageClassParameters["skuname"]
+	}
+	if diskParam != "" {
+		if sku, ok := resolveDiskSKU(diskParam); ok {
+			key.DiskStorageClass = sku.StorageClass
+			key.DiskRedundancy = sku.Redundancy
+			return
+		}
+	}
 	fileSKU := key.StorageClassParameters["skuName"]
-	if storageClass == "" {
-		storageClass = diskSKU
+	if strings.EqualFold(fileSKU, "Premium_LRS") {
+		key.DiskStorageClass = AzureFilePremiumStorageClass
+		key.IsAzureFiles = true
+	} else if strings.EqualFold(fileSKU, "Standard_LRS") {
+		key.DiskStorageClass = AzureFileStandardStorageClass
+		key.IsAzureFiles = true
 	}
-	if storageClass != "" {
-		if strings.EqualFold(storageClass, "Premium_LRS") {
-			storageClass = AzureDiskPremiumSSDStorageClass
-		} else if strings.EqualFold(storageClass, "StandardSSD_LRS") {
-			storageClass = AzureDiskStandardSSDStorageClass
-		} else if strings.EqualFold(storageClass, "Standard_LRS") {
-			storageClass = AzureDiskStandardStorageClass
-		}
-	} else {
-		if strings.EqualFold(fileSKU, "Premium_LRS") {
-			storageClass = AzureFilePremiumStorageClass
-		} else if strings.EqualFold(fileSKU, "Standard_LRS") {
-			storageClass = AzureFileStandardStorageClass
-		}
-	}
-	if region, ok := util.GetRegion(key.Labels); ok {
-		return region + "," + storageClass
-	}
+}
 
-	return key.DefaultRegion + "," + storageClass
+func (key *azurePvKey) region() string {
+	if region, ok := util.GetRegion(key.Labels); ok {
+		return region
+	}
+	return key.DefaultRegion
+}
+
+func (key *azurePvKey) Features() string {
+	if key.DiskStorageClass == "" {
+		key.resolveSKU()
+	}
+	return diskClassKey(key.region(), key.DiskStorageClass)
 }
 
 func (*Azure) GetAddresses() ([]byte, error) {
@@ -1569,40 +1685,58 @@ func (az *Azure) findCostForDisk(d *compute.Disk) (float64, error) {
 		return 0.0, fmt.Errorf("disk sku is nil")
 	}
 
-	storageClass := string(d.Sku.Name)
-	if strings.EqualFold(storageClass, "Premium_LRS") {
-		storageClass = AzureDiskPremiumSSDStorageClass
-	} else if strings.EqualFold(storageClass, "StandardSSD_LRS") {
-		storageClass = AzureDiskStandardSSDStorageClass
-	} else if strings.EqualFold(storageClass, "Standard_LRS") {
-		storageClass = AzureDiskStandardStorageClass
-	}
-
 	loc := ""
 	if d.Location != nil {
 		loc = *d.Location
 	}
-	key := loc + "," + storageClass
 
-	if p, ok := az.Pricing[key]; !ok || p == nil {
-		return 0.0, fmt.Errorf("failed to find pricing for key: %s", key)
-	}
-	if az.Pricing[key].PV == nil {
-		return 0.0, fmt.Errorf("pricing for key '%s' has nil PV", key)
-	}
-	diskPricePerGBHour, err := strconv.ParseFloat(az.Pricing[key].PV.Cost, 64)
-	if err != nil {
-		return 0.0, fmt.Errorf("error converting to float: %s", err)
-	}
 	if d.DiskProperties == nil {
 		return 0.0, fmt.Errorf("disk properties are nil")
 	}
 	if d.DiskSizeGB == nil {
 		return 0.0, fmt.Errorf("disk size is nil")
 	}
-	cost := diskPricePerGBHour * timeutil.HoursPerMonth * float64(*d.DiskSizeGB)
+	sizeGiB := float64(*d.DiskSizeGB)
 
-	return cost, nil
+	if sku, ok := resolveDiskSKU(string(d.Sku.Name)); ok {
+		tier, ok := selectDiskTier(sku.StorageClass, sizeGiB)
+		if !ok {
+			return 0.0, fmt.Errorf("failed to select disk tier for sku %s size %g", d.Sku.Name, sizeGiB)
+		}
+		tierKey := diskTierKey(loc, sku.StorageClass, sku.Redundancy, tier.Name)
+		if p, ok := az.Pricing[tierKey]; ok && p != nil && p.PV != nil {
+			monthly, err := parsePrice(p.PV.Cost)
+			if err != nil {
+				return 0.0, fmt.Errorf("error converting to float: %s", err)
+			}
+			return monthly, nil
+		}
+		// Fall back to linearized class rate × size when tier meter is missing.
+		classKey := diskClassKey(loc, sku.StorageClass)
+		if p, ok := az.Pricing[classKey]; ok && p != nil && p.PV != nil {
+			diskPricePerGBHour, err := parsePrice(p.PV.Cost)
+			if err != nil {
+				return 0.0, fmt.Errorf("error converting to float: %s", err)
+			}
+			return diskPricePerGBHour * timeutil.HoursPerMonth * sizeGiB, nil
+		}
+		return 0.0, fmt.Errorf("failed to find pricing for key: %s", tierKey)
+	}
+
+	// Unknown / custom SKU names: preserve legacy class-key lookup.
+	storageClass := string(d.Sku.Name)
+	key := loc + "," + storageClass
+	if p, ok := az.Pricing[key]; !ok || p == nil {
+		return 0.0, fmt.Errorf("failed to find pricing for key: %s", key)
+	}
+	if az.Pricing[key].PV == nil {
+		return 0.0, fmt.Errorf("pricing for key '%s' has nil PV", key)
+	}
+	diskPricePerGBHour, err := parsePrice(az.Pricing[key].PV.Cost)
+	if err != nil {
+		return 0.0, fmt.Errorf("error converting to float: %s", err)
+	}
+	return diskPricePerGBHour * timeutil.HoursPerMonth * sizeGiB, nil
 }
 
 func (az *Azure) ClusterInfo() (map[string]string, error) {
@@ -1730,9 +1864,79 @@ func (az *Azure) PVPricing(pvk models.PVKey) (*models.PV, error) {
 	az.DownloadPricingDataLock.RLock()
 	defer az.DownloadPricingDataLock.RUnlock()
 
+	if key, ok := pvk.(*azurePvKey); ok {
+		return az.pvPricingFromAzureKey(key)
+	}
+
 	pricing, ok := az.Pricing[pvk.Features()]
 	if !ok {
 		log.Debugf("Persistent Volume pricing not found for %s: %s", pvk.GetStorageClass(), pvk.Features())
+		return &models.PV{}, nil
+	}
+	return pricing.PV, nil
+}
+
+// pvPricingFromAzureKey returns an effective $/GiB-hour rate for the PV.
+// Managed disks use Azure size-tier monthly meters; the rate is chosen so that
+// rate × reportedSizeGiB × hours equals the tier's hourly cost.
+func (az *Azure) pvPricingFromAzureKey(key *azurePvKey) (*models.PV, error) {
+	if key.DiskStorageClass == "" {
+		key.resolveSKU()
+	}
+	region := key.region()
+
+	if key.IsAzureFiles || key.DiskStorageClass == AzureFilePremiumStorageClass || key.DiskStorageClass == AzureFileStandardStorageClass {
+		pricing, ok := az.Pricing[diskClassKey(region, key.DiskStorageClass)]
+		if !ok || pricing == nil || pricing.PV == nil {
+			log.Debugf("Persistent Volume pricing not found for %s: %s", key.GetStorageClass(), key.Features())
+			return &models.PV{}, nil
+		}
+		return pricing.PV, nil
+	}
+
+	if key.DiskStorageClass == "" {
+		log.Debugf("Persistent Volume pricing not found for %s: %s", key.GetStorageClass(), key.Features())
+		return &models.PV{}, nil
+	}
+
+	redundancy := key.DiskRedundancy
+	if redundancy == "" {
+		redundancy = azureDiskRedundancyLRS
+	}
+
+	if key.SizeGiB > 0 {
+		tier, ok := selectDiskTier(key.DiskStorageClass, key.SizeGiB)
+		if !ok {
+			log.Debugf("No disk tier for storage class %s size %g", key.DiskStorageClass, key.SizeGiB)
+			return &models.PV{}, nil
+		}
+		tierKey := diskTierKey(region, key.DiskStorageClass, redundancy, tier.Name)
+		pricing, ok := az.Pricing[tierKey]
+		if !ok || pricing == nil || pricing.PV == nil {
+			log.Debugf("Persistent Volume tier pricing not found for %s; falling back to class rate", tierKey)
+			return az.pvClassFallback(region, key.DiskStorageClass)
+		}
+		monthly, err := parsePrice(pricing.PV.Cost)
+		if err != nil {
+			return nil, err
+		}
+		rate := effectiveGiBHourRate(monthly, key.SizeGiB)
+		return &models.PV{
+			Cost:   formatPrice(rate),
+			Class:  key.DiskStorageClass,
+			Region: region,
+			Size:   strconv.FormatFloat(key.SizeGiB, 'f', -1, 64),
+		}, nil
+	}
+
+	log.Debugf("Persistent Volume size unknown for %s; using linearized class rate", key.Features())
+	return az.pvClassFallback(region, key.DiskStorageClass)
+}
+
+func (az *Azure) pvClassFallback(region, storageClass string) (*models.PV, error) {
+	pricing, ok := az.Pricing[diskClassKey(region, storageClass)]
+	if !ok || pricing == nil || pricing.PV == nil {
+		log.Debugf("Persistent Volume pricing not found for %s,%s", region, storageClass)
 		return &models.PV{}, nil
 	}
 	return pricing.PV, nil
