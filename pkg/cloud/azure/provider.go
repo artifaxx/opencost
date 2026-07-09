@@ -1068,11 +1068,14 @@ func convertMeterToPricings(info commerce.MeterInfo, regions map[string]string, 
 
 			if storageClass, redundancy, tier, ok := parseManagedDiskMeter(meterName); ok {
 				tierKey := diskTierKey(region, storageClass, redundancy, tier)
-				priceStr := formatPrice(priceInUsd)
-				log.Debugf("Adding PV tier key: %s, MonthlyCost: %s", tierKey, priceStr)
+				// Store whole-disk hourly cost so AllNodePricing stays in hourly units.
+				// PVPricing converts to effective $/GiB-hour using the PV's reported size.
+				hourly := tierHourlyFromMonthly(priceInUsd)
+				priceStr := formatPrice(hourly)
+				log.Debugf("Adding PV tier key: %s, HourlyCost: %s (monthly %g)", tierKey, priceStr, priceInUsd)
 				results[tierKey] = &AzurePricing{
 					PV: &models.PV{
-						Cost:   priceStr, // monthly USD for the whole disk tier
+						Cost:   priceStr,
 						Class:  storageClass,
 						Region: region,
 						Size:   tier,
@@ -1083,7 +1086,7 @@ func convertMeterToPricings(info commerce.MeterInfo, regions map[string]string, 
 				// smallest catalog LRS tier so size-unknown PVs still resolve.
 				if redundancy == azureDiskRedundancyLRS {
 					if smallest, ok := smallestDiskTier(storageClass); ok && smallest.Name == tier {
-						rate := effectiveGiBHourRate(priceInUsd, float64(smallest.SizeGiB))
+						rate := effectiveGiBHourRateFromHourly(hourly, float64(smallest.SizeGiB))
 						classKey := diskClassKey(region, storageClass)
 						rateStr := formatPrice(rate)
 						log.Debugf("Adding PV class fallback key: %s, Cost: %s", classKey, rateStr)
@@ -1102,7 +1105,7 @@ func convertMeterToPricings(info commerce.MeterInfo, regions map[string]string, 
 			if strings.Contains(meterName, "LRS Provisioned") {
 				// rate is in disk per month; Premium Files uses provisioned capacity.
 				// Keep historical linearization against 32 GiB for Azure Files Premium.
-				pricePerHour := priceInUsd / 730.0 / 32.0
+				pricePerHour := priceInUsd / timeutil.HoursPerMonth / 32.0
 				priceStr := formatPrice(pricePerHour)
 				key := diskClassKey(region, AzureFilePremiumStorageClass)
 				log.Debugf("Adding PV.Key: %s, Cost: %s", key, priceStr)
@@ -1192,10 +1195,11 @@ func addAzureFilePricing(prices map[string]*AzurePricing, regions map[string]str
 // ensureDiskClassFallbacks fills missing region,storageClass linearized $/GiB-hour
 // keys from the smallest available LRS tier meter for that class. Needed when the
 // Rate Card omits the absolute smallest catalog tier (e.g. P1) but includes P4.
+// Tier keys store whole-disk hourly cost; class keys store $/GiB-hour.
 func ensureDiskClassFallbacks(prices map[string]*AzurePricing) {
 	type candidate struct {
 		sizeGiB int
-		monthly float64
+		hourly  float64
 		region  string
 		class   string
 	}
@@ -1226,7 +1230,7 @@ func ensureDiskClassFallbacks(prices map[string]*AzurePricing) {
 		if !found {
 			continue
 		}
-		monthly, err := parsePrice(pricing.PV.Cost)
+		hourly, err := parsePrice(pricing.PV.Cost)
 		if err != nil {
 			continue
 		}
@@ -1234,14 +1238,14 @@ func ensureDiskClassFallbacks(prices map[string]*AzurePricing) {
 		if existing, ok := best[ck]; ok && existing.sizeGiB <= sizeGiB {
 			continue
 		}
-		best[ck] = candidate{sizeGiB: sizeGiB, monthly: monthly, region: region, class: class}
+		best[ck] = candidate{sizeGiB: sizeGiB, hourly: hourly, region: region, class: class}
 	}
 
 	for ck, c := range best {
 		if existing, ok := prices[ck]; ok && existing != nil && existing.PV != nil && existing.PV.Cost != "" {
 			continue
 		}
-		rate := effectiveGiBHourRate(c.monthly, float64(c.sizeGiB))
+		rate := effectiveGiBHourRateFromHourly(c.hourly, float64(c.sizeGiB))
 		rateStr := formatPrice(rate)
 		log.Debugf("Adding PV class fallback key from available tiers: %s, Cost: %s", ck, rateStr)
 		prices[ck] = &AzurePricing{
@@ -1703,15 +1707,30 @@ func (az *Azure) findCostForDisk(d *compute.Disk) (float64, error) {
 		if !ok {
 			return 0.0, fmt.Errorf("failed to select disk tier for sku %s size %g", d.Sku.Name, sizeGiB)
 		}
-		tierKey := diskTierKey(loc, sku.StorageClass, sku.Redundancy, tier.Name)
-		if p, ok := az.Pricing[tierKey]; ok && p != nil && p.PV != nil {
-			monthly, err := parsePrice(p.PV.Cost)
+		hasPrice := func(tierName string) bool {
+			p, ok := az.Pricing[diskTierKey(loc, sku.StorageClass, sku.Redundancy, tierName)]
+			return ok && p != nil && p.PV != nil
+		}
+		pricedTier, ok := pickNearestAvailableTier(sku.StorageClass, tier.Name, hasPrice)
+		if ok {
+			if pricedTier.Name != tier.Name {
+				log.Warnf("Azure disk tier meter %s missing for %s %s; using nearest available tier %s",
+					tier.Name, sku.StorageClass, sku.Redundancy, pricedTier.Name)
+			}
+			tierKey := diskTierKey(loc, sku.StorageClass, sku.Redundancy, pricedTier.Name)
+			hourly, err := parsePrice(az.Pricing[tierKey].PV.Cost)
 			if err != nil {
 				return 0.0, fmt.Errorf("error converting to float: %s", err)
 			}
-			return monthly, nil
+			return hourly * timeutil.HoursPerMonth, nil
 		}
-		// Fall back to linearized class rate × size when tier meter is missing.
+		if sku.Redundancy == azureDiskRedundancyZRS {
+			log.Warnf("Azure ZRS disk pricing unavailable for %s size %g; falling back to LRS class rate", loc, sizeGiB)
+		} else {
+			log.Warnf("Azure disk tier pricing unavailable for %s; falling back to linearized class rate",
+				diskTierKey(loc, sku.StorageClass, sku.Redundancy, tier.Name))
+		}
+		// Fall back to linearized class rate × size when no tier meter is available.
 		classKey := diskClassKey(loc, sku.StorageClass)
 		if p, ok := az.Pricing[classKey]; ok && p != nil && p.PV != nil {
 			diskPricePerGBHour, err := parsePrice(p.PV.Cost)
@@ -1720,7 +1739,7 @@ func (az *Azure) findCostForDisk(d *compute.Disk) (float64, error) {
 			}
 			return diskPricePerGBHour * timeutil.HoursPerMonth * sizeGiB, nil
 		}
-		return 0.0, fmt.Errorf("failed to find pricing for key: %s", tierKey)
+		return 0.0, fmt.Errorf("failed to find pricing for key: %s", diskTierKey(loc, sku.StorageClass, sku.Redundancy, tier.Name))
 	}
 
 	// Unknown / custom SKU names: preserve legacy class-key lookup.
@@ -1877,7 +1896,7 @@ func (az *Azure) PVPricing(pvk models.PVKey) (*models.PV, error) {
 }
 
 // pvPricingFromAzureKey returns an effective $/GiB-hour rate for the PV.
-// Managed disks use Azure size-tier monthly meters; the rate is chosen so that
+// Managed disks use Azure size-tier meters; the rate is chosen so that
 // rate × reportedSizeGiB × hours equals the tier's hourly cost.
 func (az *Azure) pvPricingFromAzureKey(key *azurePvKey) (*models.PV, error) {
 	if key.DiskStorageClass == "" {
@@ -1907,20 +1926,30 @@ func (az *Azure) pvPricingFromAzureKey(key *azurePvKey) (*models.PV, error) {
 	if key.SizeGiB > 0 {
 		tier, ok := selectDiskTier(key.DiskStorageClass, key.SizeGiB)
 		if !ok {
-			log.Debugf("No disk tier for storage class %s size %g", key.DiskStorageClass, key.SizeGiB)
-			return &models.PV{}, nil
+			log.Warnf("No disk tier for storage class %s size %g; falling back to class rate", key.DiskStorageClass, key.SizeGiB)
+			return az.pvClassFallback(region, key.DiskStorageClass, redundancy)
 		}
-		tierKey := diskTierKey(region, key.DiskStorageClass, redundancy, tier.Name)
-		pricing, ok := az.Pricing[tierKey]
-		if !ok || pricing == nil || pricing.PV == nil {
-			log.Debugf("Persistent Volume tier pricing not found for %s; falling back to class rate", tierKey)
-			return az.pvClassFallback(region, key.DiskStorageClass)
+		hasPrice := func(tierName string) bool {
+			p, ok := az.Pricing[diskTierKey(region, key.DiskStorageClass, redundancy, tierName)]
+			return ok && p != nil && p.PV != nil
 		}
-		monthly, err := parsePrice(pricing.PV.Cost)
+		pricedTier, ok := pickNearestAvailableTier(key.DiskStorageClass, tier.Name, hasPrice)
+		if !ok {
+			log.Warnf("Persistent Volume tier pricing not found for %s size %g (%s); falling back to class rate",
+				diskTierKey(region, key.DiskStorageClass, redundancy, tier.Name), key.SizeGiB, redundancy)
+			return az.pvClassFallback(region, key.DiskStorageClass, redundancy)
+		}
+		if pricedTier.Name != tier.Name {
+			log.Warnf("Azure disk tier meter %s missing for %s; using nearest available tier %s",
+				tier.Name, diskClassKey(region, key.DiskStorageClass), pricedTier.Name)
+		}
+		tierKey := diskTierKey(region, key.DiskStorageClass, redundancy, pricedTier.Name)
+		pricing := az.Pricing[tierKey]
+		hourly, err := parsePrice(pricing.PV.Cost)
 		if err != nil {
 			return nil, err
 		}
-		rate := effectiveGiBHourRate(monthly, key.SizeGiB)
+		rate := effectiveGiBHourRateFromHourly(hourly, key.SizeGiB)
 		return &models.PV{
 			Cost:   formatPrice(rate),
 			Class:  key.DiskStorageClass,
@@ -1929,11 +1958,18 @@ func (az *Azure) pvPricingFromAzureKey(key *azurePvKey) (*models.PV, error) {
 		}, nil
 	}
 
-	log.Debugf("Persistent Volume size unknown for %s; using linearized class rate", key.Features())
-	return az.pvClassFallback(region, key.DiskStorageClass)
+	if redundancy == azureDiskRedundancyZRS {
+		log.Warnf("Persistent Volume size unknown for ZRS volume %s; using LRS linearized class rate", key.Features())
+	} else {
+		log.Debugf("Persistent Volume size unknown for %s; using linearized class rate", key.Features())
+	}
+	return az.pvClassFallback(region, key.DiskStorageClass, redundancy)
 }
 
-func (az *Azure) pvClassFallback(region, storageClass string) (*models.PV, error) {
+func (az *Azure) pvClassFallback(region, storageClass, redundancy string) (*models.PV, error) {
+	if redundancy == azureDiskRedundancyZRS {
+		log.Warnf("Azure ZRS class-level pricing is unavailable; using LRS linearized rate for %s,%s", region, storageClass)
+	}
 	pricing, ok := az.Pricing[diskClassKey(region, storageClass)]
 	if !ok || pricing == nil || pricing.PV == nil {
 		log.Debugf("Persistent Volume pricing not found for %s,%s", region, storageClass)

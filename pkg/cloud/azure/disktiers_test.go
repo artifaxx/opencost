@@ -54,3 +54,23 @@ func TestEffectiveGiBHourRate(t *testing.T) {
 	require.InDelta(t, 5.2795/730.0/10.0, effectiveGiBHourRate(5.2795, 10), 1e-12)
 	require.Equal(t, 0.0, effectiveGiBHourRate(5.2795, 0))
 }
+
+func TestPickNearestAvailableTier(t *testing.T) {
+	available := map[string]bool{"P4": true, "P15": true}
+	has := func(name string) bool { return available[name] }
+
+	tier, ok := pickNearestAvailableTier(AzureDiskPremiumSSDStorageClass, "P10", has)
+	require.True(t, ok)
+	require.Equal(t, "P15", tier.Name, "prefer larger tier on equal distance")
+
+	tier, ok = pickNearestAvailableTier(AzureDiskPremiumSSDStorageClass, "P4", has)
+	require.True(t, ok)
+	require.Equal(t, "P4", tier.Name)
+
+	_, ok = pickNearestAvailableTier(AzureDiskPremiumSSDStorageClass, "P10", func(string) bool { return false })
+	require.False(t, ok)
+}
+
+func TestTierHourlyFromMonthly(t *testing.T) {
+	require.InDelta(t, 5.2795/730.0, tierHourlyFromMonthly(5.2795), 1e-12)
+}

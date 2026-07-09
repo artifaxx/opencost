@@ -2,11 +2,13 @@ package azure
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/opencost/opencost/core/pkg/clustercache"
+	"github.com/opencost/opencost/core/pkg/util/timeutil"
 )
 
 // Azure managed disk size tiers (GiB), ordered ascending.
@@ -180,13 +182,74 @@ func smallestDiskTier(storageClass string) (diskTier, bool) {
 	return tiers[0], true
 }
 
+// tierHourlyFromMonthly converts a fixed monthly tier price to a whole-disk
+// hourly cost. Stored in models.PV.Cost for tier keys so AllNodePricing stays
+// in hourly units (class keys store $/GiB-hour).
+func tierHourlyFromMonthly(monthlyTierPrice float64) float64 {
+	if monthlyTierPrice <= 0 {
+		return 0
+	}
+	return monthlyTierPrice / timeutil.HoursPerMonth
+}
+
 // effectiveGiBHourRate converts a fixed monthly tier price into the $/GiB-hour
 // rate that, when multiplied by reportedSizeGiB, recovers the tier hourly cost.
 func effectiveGiBHourRate(monthlyTierPrice, reportedSizeGiB float64) float64 {
-	if monthlyTierPrice <= 0 || reportedSizeGiB <= 0 {
+	return effectiveGiBHourRateFromHourly(tierHourlyFromMonthly(monthlyTierPrice), reportedSizeGiB)
+}
+
+// effectiveGiBHourRateFromHourly converts a whole-disk hourly tier price into
+// the $/GiB-hour rate used by allocation (rate × GiB × hours).
+func effectiveGiBHourRateFromHourly(tierHourlyPrice, reportedSizeGiB float64) float64 {
+	if tierHourlyPrice <= 0 || reportedSizeGiB <= 0 {
 		return 0
 	}
-	return monthlyTierPrice / 730.0 / reportedSizeGiB
+	return tierHourlyPrice / reportedSizeGiB
+}
+
+// nearestDiskTierIndex returns the index of preferred in the class tier table,
+// or -1 if not found.
+func diskTierIndex(storageClass, tierName string) int {
+	tiers := tiersForStorageClass(storageClass)
+	for i, tier := range tiers {
+		if tier.Name == tierName {
+			return i
+		}
+	}
+	return -1
+}
+
+// pickNearestAvailableTier chooses the closest available priced tier to the
+// preferred size tier. Prefers the next larger tier, then smaller.
+func pickNearestAvailableTier(storageClass, preferredTier string, hasPrice func(tierName string) bool) (diskTier, bool) {
+	tiers := tiersForStorageClass(storageClass)
+	idx := diskTierIndex(storageClass, preferredTier)
+	if idx < 0 {
+		return diskTier{}, false
+	}
+	if hasPrice(tiers[idx].Name) {
+		return tiers[idx], true
+	}
+	bestIdx := -1
+	bestDist := math.MaxInt
+	for i, tier := range tiers {
+		if !hasPrice(tier.Name) {
+			continue
+		}
+		dist := i - idx
+		if dist < 0 {
+			dist = -dist
+		}
+		// Prefer larger tiers on a tie (Azure rounds up).
+		if dist < bestDist || (dist == bestDist && i > bestIdx) {
+			bestDist = dist
+			bestIdx = i
+		}
+	}
+	if bestIdx < 0 {
+		return diskTier{}, false
+	}
+	return tiers[bestIdx], true
 }
 
 func formatPrice(price float64) string {
