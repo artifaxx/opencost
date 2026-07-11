@@ -240,23 +240,33 @@ func getRegions(service string, subscriptionsClient subscriptions.Client, provid
 	}
 }
 
-func buildAzureRetailPricesURL(region string, skuName string, currencyCode string) string {
+// buildAzureRetailPricesURLWithFilter assembles the Azure Retail Prices API URL
+// shared by VM and managed-disk retail lookups.
+func buildAzureRetailPricesURLWithFilter(currencyCode string, filterParams []string) string {
 	pricingURL := "https://prices.azure.com/api/retail/prices?$skip=0"
 
 	if currencyCode != "" {
 		pricingURL += fmt.Sprintf("&currencyCode='%s'", currencyCode)
 	}
 
+	if len(filterParams) == 0 {
+		return pricingURL
+	}
+
+	filterParamsEscaped := url.QueryEscape(strings.Join(filterParams, " and "))
+	pricingURL += fmt.Sprintf("&$filter=%s", filterParamsEscaped)
+	return pricingURL
+}
+
+func buildAzureRetailPricesURL(region string, skuName string, currencyCode string) string {
 	var filterParams []string
 
 	if region != "" {
-		regionParam := fmt.Sprintf("armRegionName eq '%s'", region)
-		filterParams = append(filterParams, regionParam)
+		filterParams = append(filterParams, fmt.Sprintf("armRegionName eq '%s'", region))
 	}
 
 	if skuName != "" {
-		skuNameParam := fmt.Sprintf("armSkuName eq '%s'", skuName)
-		filterParams = append(filterParams, skuNameParam)
+		filterParams = append(filterParams, fmt.Sprintf("armSkuName eq '%s'", skuName))
 	}
 
 	// Make sure only service name with Virtual Machines are parsed with skuName
@@ -268,10 +278,21 @@ func buildAzureRetailPricesURL(region string, skuName string, currencyCode strin
 	// Exclude Low Priority instances[Azure has special computes that let you run workloads on spare capacity at a deeply discounted price in exchange for no SLA and the possibility of being evicted]
 	filterParams = append(filterParams, "contains(meterName,'Low Priority') eq false")
 
-	filterParamsEscaped := url.QueryEscape(strings.Join(filterParams[:], " and "))
-	pricingURL += fmt.Sprintf("&$filter=%s", filterParamsEscaped)
+	return buildAzureRetailPricesURLWithFilter(currencyCode, filterParams)
+}
 
-	return pricingURL
+// buildAzureRetailDiskPricesURL builds a Retail Prices API URL for managed disk
+// capacity meters (LRS/ZRS). Used to gap-fill tiers missing from Rate Card /
+// Price Sheet (notably Premium SSD ZRS in some regions).
+func buildAzureRetailDiskPricesURL(currencyCode string) string {
+	filterParams := []string{
+		"serviceFamily eq 'Storage'",
+		"type eq 'Consumption'",
+		"(productName eq 'Premium SSD Managed Disks' or productName eq 'Standard SSD Managed Disks' or productName eq 'Standard HDD Managed Disks')",
+		"contains(meterName,' Disk')",
+		"contains(meterName,'Mount') eq false",
+	}
+	return buildAzureRetailPricesURLWithFilter(currencyCode, filterParams)
 }
 
 func extractAzureVMRetailAndSpotPrices(resp *http.Response) (linuxRetailPrice string, windowsRetailPrice string, spotPrice string, windowsSpotPrice string, err error) {
@@ -990,6 +1011,10 @@ func (az *Azure) DownloadPricingData() error {
 	}
 	addAzureFilePricing(allPrices, regions)
 	ensureDiskClassFallbacks(allPrices)
+	if err := supplementManagedDiskTiersFromRetail(context.Background(), allPrices, currency); err != nil {
+		// Rate Card remains usable; log and continue with whatever tiers we have.
+		log.Warnf("Azure retail managed disk price supplement failed: %s", err)
+	}
 	tierHourly := collectManagedDiskTierHourly(allPrices)
 	removeManagedDiskTierEntries(allPrices)
 
@@ -1025,6 +1050,9 @@ func (az *Azure) DownloadPricingData() error {
 			}
 			addAzureFilePricing(allPrices, regions)
 			ensureDiskClassFallbacks(allPrices)
+			if err := supplementManagedDiskTiersFromRetail(ctx, allPrices, currency); err != nil {
+				log.Warnf("Azure retail managed disk price supplement failed: %s", err)
+			}
 			tierHourly := collectManagedDiskTierHourly(allPrices)
 			removeManagedDiskTierEntries(allPrices)
 			az.Pricing = allPrices
@@ -1264,6 +1292,104 @@ func ensureDiskClassFallbacks(prices map[string]*AzurePricing) {
 			},
 		}
 	}
+}
+
+// supplementManagedDiskTiersFromRetail fills missing managed-disk tier keys in
+// prices from the public Azure Retail Prices API. Existing Rate Card / Price
+// Sheet keys are left unchanged so negotiated prices win.
+func supplementManagedDiskTiersFromRetail(ctx context.Context, prices map[string]*AzurePricing, currencyCode string) error {
+	items, err := downloadRetailManagedDiskPrices(ctx, currencyCode)
+	if err != nil {
+		return err
+	}
+	added := mergeRetailManagedDiskTiers(prices, items)
+	if added > 0 {
+		log.Infof("Supplemented %d managed disk tier prices from Azure Retail Prices API", added)
+		ensureDiskClassFallbacks(prices)
+	}
+	return nil
+}
+
+// downloadRetailManagedDiskPrices paginates the Retail Prices API for managed
+// disk capacity meters.
+func downloadRetailManagedDiskPrices(ctx context.Context, currencyCode string) ([]AzureRetailPricingAttributes, error) {
+	pricingURL := buildAzureRetailDiskPricesURL(currencyCode)
+	log.Infof("starting download retail managed disk prices from \"%s\"", pricingURL)
+
+	var items []AzureRetailPricingAttributes
+	for pricingURL != "" {
+		resp, err := httputil.StreamingGet(ctx, pricingURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch retail managed disk prices from \"%s\": %w", pricingURL, err)
+		}
+
+		body, readErr := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("error reading retail managed disk price response: %w", readErr)
+		}
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			return nil, fmt.Errorf("retail managed disk prices responded with status code %d", resp.StatusCode)
+		}
+
+		payload := AzureRetailPricing{}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			return nil, fmt.Errorf("error unmarshalling retail managed disk prices: %w", err)
+		}
+		items = append(items, payload.Items...)
+		pricingURL = payload.NextPageLink
+	}
+
+	log.Infof("downloaded %d retail managed disk price items", len(items))
+	return items, nil
+}
+
+// mergeRetailManagedDiskTiers inserts retail capacity meters into prices only
+// when the tier key is not already present. Returns the number of keys added.
+func mergeRetailManagedDiskTiers(prices map[string]*AzurePricing, items []AzureRetailPricingAttributes) int {
+	added := 0
+	for _, item := range items {
+		key, pricing, ok := retailItemToManagedDiskPricing(item)
+		if !ok {
+			continue
+		}
+		if _, exists := prices[key]; exists {
+			continue
+		}
+		prices[key] = pricing
+		added++
+	}
+	return added
+}
+
+// retailItemToManagedDiskPricing maps a Retail Prices API item to a managed
+// disk tier pricing entry. Uses armRegionName directly (e.g. eastus2).
+func retailItemToManagedDiskPricing(item AzureRetailPricingAttributes) (string, *AzurePricing, bool) {
+	if strings.Contains(item.MeterName, "Disk Mount") {
+		return "", nil, false
+	}
+	storageClass, redundancy, tier, ok := parseManagedDiskMeter(item.MeterName)
+	if !ok {
+		return "", nil, false
+	}
+	region := strings.TrimSpace(item.ArmRegionName)
+	if region == "" {
+		return "", nil, false
+	}
+	monthly := float64(item.RetailPrice)
+	if monthly <= 0 {
+		return "", nil, false
+	}
+	hourly := tierHourlyFromMonthly(monthly)
+	key := diskTierKey(region, storageClass, redundancy, tier)
+	return key, &AzurePricing{
+		PV: &models.PV{
+			Cost:   formatPrice(hourly),
+			Class:  storageClass,
+			Region: region,
+			Size:   tier,
+		},
+	}, true
 }
 
 // collectManagedDiskTierHourly collects the hourly cost of managed disk tiers from the provided pricing data.

@@ -792,6 +792,108 @@ func Test_buildAzureRetailPricesURL(t *testing.T) {
 	}
 }
 
+func Test_buildAzureRetailDiskPricesURL(t *testing.T) {
+	got := buildAzureRetailDiskPricesURL("USD")
+	require.Contains(t, got, "https://prices.azure.com/api/retail/prices?$skip=0")
+	require.Contains(t, got, "currencyCode='USD'")
+	require.Contains(t, got, "serviceFamily+eq+%27Storage%27")
+	require.Contains(t, got, "type+eq+%27Consumption%27")
+	require.Contains(t, got, "Premium+SSD+Managed+Disks")
+	require.Contains(t, got, "Standard+SSD+Managed+Disks")
+	require.Contains(t, got, "Standard+HDD+Managed+Disks")
+	require.Contains(t, got, "contains%28meterName%2C%27+Disk%27%29")
+	require.Contains(t, got, "contains%28meterName%2C%27Mount%27%29+eq+false")
+	require.NotContains(t, got, "serviceFamily+eq+%27Compute%27")
+	require.NotContains(t, got, "Low+Priority")
+
+	noCurrency := buildAzureRetailDiskPricesURL("")
+	require.NotContains(t, noCurrency, "currencyCode")
+	require.Contains(t, noCurrency, "serviceFamily+eq+%27Storage%27")
+}
+
+func TestRetailItemToManagedDiskPricing_EastUS2PremiumZRS(t *testing.T) {
+	item := AzureRetailPricingAttributes{
+		ArmRegionName: "eastus2",
+		MeterName:     "P6 ZRS Disk",
+		ProductName:   "Premium SSD Managed Disks",
+		RetailPrice:   13.92,
+		ServiceFamily: "Storage",
+	}
+	key, pricing, ok := retailItemToManagedDiskPricing(item)
+	require.True(t, ok)
+	require.Equal(t, "eastus2,premium_ssd,ZRS,P6", key)
+	require.NotNil(t, pricing.PV)
+	require.Equal(t, formatPrice(tierHourlyFromMonthly(13.92)), pricing.PV.Cost)
+	require.Equal(t, AzureDiskPremiumSSDStorageClass, pricing.PV.Class)
+	require.Equal(t, "eastus2", pricing.PV.Region)
+	require.Equal(t, "P6", pricing.PV.Size)
+}
+
+func TestRetailItemToManagedDiskPricing_SkipsDiskMount(t *testing.T) {
+	item := AzureRetailPricingAttributes{
+		ArmRegionName: "eastus2",
+		MeterName:     "P6 ZRS Disk Mount",
+		RetailPrice:   0.47,
+	}
+	_, _, ok := retailItemToManagedDiskPricing(item)
+	require.False(t, ok)
+}
+
+func TestMergeRetailManagedDiskTiers_FillsGapsWithoutOverwrite(t *testing.T) {
+	prices := map[string]*AzurePricing{
+		"eastus2,premium_ssd,LRS,P6": {
+			PV: &models.PV{Cost: formatPrice(tierHourlyFromMonthly(9.60)), Class: AzureDiskPremiumSSDStorageClass, Region: "eastus2", Size: "P6"},
+		},
+		"eastus2,premium_ssd,ZRS,P4": {
+			PV: &models.PV{Cost: formatPrice(tierHourlyFromMonthly(99.0)), Class: AzureDiskPremiumSSDStorageClass, Region: "eastus2", Size: "P4"},
+		},
+	}
+	items := []AzureRetailPricingAttributes{
+		{ArmRegionName: "eastus2", MeterName: "P6 ZRS Disk", RetailPrice: 13.92},
+		{ArmRegionName: "eastus2", MeterName: "P4 ZRS Disk", RetailPrice: 7.2}, // existing key — must not overwrite
+		{ArmRegionName: "eastus2", MeterName: "P6 ZRS Disk Mount", RetailPrice: 0.47},
+		{ArmRegionName: "", MeterName: "P10 ZRS Disk", RetailPrice: 26.88},
+	}
+
+	added := mergeRetailManagedDiskTiers(prices, items)
+	require.Equal(t, 1, added)
+	require.Contains(t, prices, "eastus2,premium_ssd,ZRS,P6")
+	require.Equal(t, formatPrice(tierHourlyFromMonthly(13.92)), prices["eastus2,premium_ssd,ZRS,P6"].PV.Cost)
+	require.Equal(t, formatPrice(tierHourlyFromMonthly(99.0)), prices["eastus2,premium_ssd,ZRS,P4"].PV.Cost)
+	require.Equal(t, formatPrice(tierHourlyFromMonthly(9.60)), prices["eastus2,premium_ssd,LRS,P6"].PV.Cost)
+}
+
+func TestAzurePVPricing_RetailSupplementedZRS(t *testing.T) {
+	prices := map[string]*AzurePricing{
+		"eastus2,premium_ssd": {
+			PV: &models.PV{Cost: "0.000226", Class: AzureDiskPremiumSSDStorageClass, Region: "eastus2"},
+		},
+	}
+	items := []AzureRetailPricingAttributes{
+		{ArmRegionName: "eastus2", MeterName: "P6 ZRS Disk", RetailPrice: 13.92},
+	}
+	require.Equal(t, 1, mergeRetailManagedDiskTiers(prices, items))
+	tierHourly := collectManagedDiskTierHourly(prices)
+	removeManagedDiskTierEntries(prices)
+
+	az := &Azure{
+		Pricing:               prices,
+		managedDiskTierHourly: tierHourly,
+	}
+	key := &azurePvKey{
+		DefaultRegion: "eastus2",
+		SizeGiB:       64,
+		StorageClassParameters: map[string]string{
+			"skuname": "Premium_ZRS",
+		},
+	}
+	key.resolveSKU()
+	pv, err := az.PVPricing(key)
+	require.NoError(t, err)
+	require.Equal(t, formatPrice(effectiveGiBHourRate(13.92, 64)), pv.Cost)
+	require.Equal(t, "64", pv.Size)
+}
+
 func TestAzureKeyFeaturesOS(t *testing.T) {
 	tests := []struct {
 		name     string
